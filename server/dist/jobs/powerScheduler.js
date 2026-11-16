@@ -5,9 +5,9 @@ import { analyzeSleepWhenBedEmpty } from './sleepAnalysisWait.js';
 import serverStatus from '../serverStatus.js';
 import logger from '../logger.js';
 import servicesDB from '../db/services.js';
-import { MAX_TARGET_F } from '../8sleep/temperatureLevels.js';
+import { MAX_TARGET_F, MIN_TARGET_F } from '../8sleep/temperatureLevels.js';
 import memoryDB from '../db/memoryDB.js';
-import { getAmbientOffset, logComfortEvent, recordAppliedOffset, surfaceControlEnabled } from './comfort.js';
+import { getAmbientOffset, logComfortEvent, recordAppliedOffset, compensationEnabled } from './comfort.js';
 export const schedulePowerOn = (settingsData, side, day, power) => {
     if (!power.enabled)
         return;
@@ -27,12 +27,11 @@ export const schedulePowerOn = (settingsData, side, day, power) => {
     schedule.scheduleJob(`${side}-${day}-${time}-power-on`, onRule, async () => {
         try {
             logJob('Executing power on job', side, day, dayOfWeekIndex, time);
-            // Bed control holds the bed temperature itself, so skip the room offset.
-            const surfaceOn = await surfaceControlEnabled();
-            const { offsetF, roomF } = surfaceOn ? { offsetF: 0, roomF: null } : await getAmbientOffset();
-            const targetTemperatureF = Math.min(MAX_TARGET_F, power.onTemperature + offsetF);
+            const { offsetF, roomF } = await getAmbientOffset();
+            const targetTemperatureF = Math.max(MIN_TARGET_F, Math.min(MAX_TARGET_F, power.onTemperature + offsetF));
             if (offsetF) {
-                logJob(`Room is ${roomF}°F, warming power-on ${power.onTemperature}°F by ${offsetF}°F`, side, day, dayOfWeekIndex, time);
+                const verb = offsetF > 0 ? 'warming' : 'cooling';
+                logJob(`Room is ${roomF}°F, ${verb} power-on ${power.onTemperature}°F by ${Math.abs(offsetF)}°F`, side, day, dayOfWeekIndex, time);
             }
             await updateDeviceStatus({
                 [side]: {
@@ -40,7 +39,7 @@ export const schedulePowerOn = (settingsData, side, day, power) => {
                     targetTemperatureF,
                 }
             });
-            recordAppliedOffset(side, surfaceOn ? null : offsetF);
+            recordAppliedOffset(side, (await compensationEnabled()) ? offsetF : null);
             logComfortEvent('power_on', { side, scheduledF: power.onTemperature, offsetF, appliedF: targetTemperatureF, roomF });
             serverStatus.status.powerSchedule.status = 'healthy';
             serverStatus.status.powerSchedule.message = '';

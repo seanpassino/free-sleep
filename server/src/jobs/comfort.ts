@@ -1,4 +1,5 @@
-// Room-temperature compensation for scheduled temperatures, plus a comfort log
+// Room-temperature compensation for scheduled temperatures (water temperatures, or bed setpoints while
+// bed control is on: surfaceControl.roomCompensation), plus a comfort log
 // (/persistent/free-sleep-data/comfort-log.jsonl) of adjustments and sensor snapshots
 // to learn from later.
 import fs from 'fs';
@@ -13,7 +14,8 @@ import logger from '../logger.js';
 import { fToLevel, levelToF, MAX_TARGET_F, MIN_TARGET_F } from '../8sleep/temperatureLevels.js';
 import { executeFunction } from '../8sleep/deviceApi.js';
 import {
-  bedControlEnabled, bedProportionalF, bedSide, bedTemperatureF, bedWaterF, correctBed, noteWaterTarget, sampleSurface, waterTargetLevel,
+  bedControlEnabled, bedIsSettledEmpty, bedProportionalF, bedSide, bedTemperatureF, bedWaterF, correctBed, noteWaterTarget, sampleSurface,
+  waterTargetLevel,
 } from '../8sleep/bedControl.js';
 import { DeviceStatus } from '../routes/deviceStatus/deviceStatusSchema.js';
 import { isPresent } from '../routes/metrics/presence.js';
@@ -66,29 +68,32 @@ const medianRoomF = (): number | null => {
   return Math.round(median * 10) / 10;
 };
 
-export const surfaceControlEnabled = async (): Promise<boolean> => {
-  try {
-    await comfortDB.read();
-    return comfortDB.data.surfaceControl?.enabled === true;
-  } catch (error) {
-    logger.error(error);
-    return false;
-  }
-};
-
 // ---------------------------------------------------------------------------------------------
 
 export type AmbientOffset = { offsetF: number; exactOffsetF: number; roomF: number | null };
 
+// The settings in force: bed setpoints get their own (they can also cool, in a warm room)
+const compensation = () => {
+  if (bedControlEnabled()) {
+    return comfortDB.data.surfaceControl.roomCompensation ?? { enabled: false, baseRoomF: 72, gain: 0, minOffsetF: 0, maxOffsetF: 0 };
+  }
+  return { ...comfortDB.data.ambientCompensation, minOffsetF: 0 };
+};
+
+export const compensationEnabled = async (): Promise<boolean> => {
+  await comfortDB.read();
+  return compensation().enabled;
+};
+
 export const getAmbientOffset = async (): Promise<AmbientOffset> => {
   try {
     await comfortDB.read();
-    const { enabled, baseRoomF, gain, maxOffsetF } = comfortDB.data.ambientCompensation;
+    const { enabled, baseRoomF, gain, minOffsetF, maxOffsetF } = compensation();
     sampleRoom();
     const roomF = medianRoomF();
     if (!enabled || roomF === null) return { offsetF: 0, exactOffsetF: 0, roomF };
 
-    const exactOffsetF = Math.min(maxOffsetF, Math.max(0, gain * (baseRoomF - roomF)));
+    const exactOffsetF = Math.min(maxOffsetF, Math.max(minOffsetF, gain * (baseRoomF - roomF)));
     return { offsetF: Math.round(exactOffsetF), exactOffsetF: Math.round(exactOffsetF * 100) / 100, roomF };
   } catch (error) {
     logger.error(error);
@@ -172,8 +177,7 @@ const recheckSide = async (side: Side, sideState: SideState) => {
 const recheck = async () => {
   try {
     await comfortDB.read();
-    // Bed control holds the bed temperature itself (bedControlTick), so no room offset on top
-    if (bedControlEnabled() || !comfortDB.data.ambientCompensation.enabled) return;
+    if (!compensation().enabled) return;
     const state = readState();
     for (const side of ['left', 'right'] as const) {
       const sideState = state[side];
@@ -214,11 +218,12 @@ const bedControlTick = async (sensors: SensorSnapshot | null, status: DeviceStat
       const bedF = bedTemperatureF(side);
       const bed = bedSide(side);
       const pF = bed ? Math.round(bedProportionalF(side, bed.setpointF) * 100) / 100 : 0;
+      const empty = bedIsSettledEmpty(side);
       logger.info(
         `BedControl: ${side} bed ${bedF}°F, setpoint ${bed?.setpointF}°F -> water ${levelToF(level)}°F`
-        + ` (offset ${bed?.offsetF.toFixed(2)}, P ${pF > 0 ? '+' : ''}${pF.toFixed(2)})`,
+        + ` (offset ${bed?.offsetF.toFixed(2)}, P ${pF > 0 ? '+' : ''}${pF.toFixed(2)}${empty ? ', empty bed' : ''})`,
       );
-      logComfortEvent('bed_correct', { side, bedF, waterF, level, pF, setpointF: bed?.setpointF, offsetF: bed?.offsetF });
+      logComfortEvent('bed_correct', { side, bedF, waterF, level, pF, setpointF: bed?.setpointF, offsetF: bed?.offsetF, empty });
     }
   } catch (error) {
     logger.error(error);

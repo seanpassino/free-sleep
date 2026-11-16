@@ -2,7 +2,8 @@
 // HA, the side buttons and schedules show and set is the bed surface temperature, not the water's.
 // The firmware only takes a water target, so this is a PI loop around it, recalculated every minute:
 // water target = feed-forward(setpoint) + offset (the integral term) + proportional term.
-// While the side is empty only the first two apply and the offset is left alone.
+// While the side is empty only the first two apply and the offset is left alone; once it has been empty
+// a while the water is aimed at the empty bed instead (emptyBedWaterF).
 // State: /persistent/free-sleep-data/bed-state.json.
 import fs from 'fs';
 import comfortDB from '../db/comfort.js';
@@ -37,6 +38,20 @@ const MAX_OFFSET_F = 10;
 // setpoint, so a wake-up ramp doesn't carry over into the next night's bedtime.
 const FEED_FORWARD_SLOPE = 0.4;
 const FEED_FORWARD_REFERENCE_F = 76;
+// Empty bed. The offset is mostly body heat (the probe under a sleeper reads 2-4°F above the water), so
+// applied to an empty bed it left the bed 4-7°F under the setpoint on cold nights (2026-11-12 to 11-14:
+// got into a 70°F bed at setpoint 75, room 65). Settled empty bed, nights 10-29 to 11-15 (586 min, more
+// than 45 min after anyone was in it, room 64-72°F): bed = 0.11 + 0.520 x water + 0.515 x room (SD 0.86).
+const EMPTY_BED_INTERCEPT_F = 0.11;
+const EMPTY_BED_WATER = 0.52;
+const EMPTY_BED_ROOM = 0.515;
+// Fully holding an empty bed in a cold room takes water far above the setpoint (80 at 66°F: ~88), which
+// would be too hot to get into once body heat adds its 2-4°F, so the pre-warm stops here
+const EMPTY_MAX_ABOVE_SETPOINT_F = 4;
+// Only after the side has been empty this long: presence flickers, and reads empty for a few minutes
+// after a restart even with someone in bed
+const EMPTY_AFTER_MS = 10 * 60 * 1000;
+const ROOM_WINDOW_MS = 30 * 60 * 1000;
 // Probe 'body': the bed temperature is the probes weighted by where capacitance finds the sleeper.
 // Below this summed rise over the empty-bed baseline there's no reliable position (the stream's
 // CapPresence stays confirmed down to the same level), so the center probe is used.
@@ -48,6 +63,11 @@ const POSITION_SHIFT = 0.5;
 // Capacitance briefly losing the sleeper would otherwise jump the reading ~2°F to the center probe
 const POSITION_HOLD_MS = 10 * 60 * 1000;
 const samples = { left: [], right: [] };
+const roomSamples = [];
+// Last minute each side was seen occupied; the server start counts, since presence is unknown until the
+// stream reports
+const startedAt = Date.now();
+const lastPresentAt = { left: startedAt, right: startedAt };
 // Last water target the firmware reported, per side (noted by loadDeviceStatus)
 const waterTarget = {};
 export const bedControlEnabled = () => comfortDB.data.surfaceControl?.enabled === true;
@@ -121,11 +141,25 @@ export const sampleSurface = (sensors) => {
         samples.left.push({ at: now, f: probeValue('left', sensors.surfaceF.left, sensors.capacitance?.left) });
         samples.right.push({ at: now, f: probeValue('right', sensors.surfaceF.right, sensors.capacitance?.right) });
     }
+    if (typeof sensors?.roomF === 'number' && now / 1000 - sensors.ts < SURFACE_STALE_SECONDS)
+        roomSamples.push({ at: now, f: sensors.roomF });
+    while (roomSamples.length && now - roomSamples[0].at > ROOM_WINDOW_MS)
+        roomSamples.shift();
     for (const side of ['left', 'right']) {
         while (samples[side].length && now - samples[side][0].at > SURFACE_WINDOW_MS)
             samples[side].shift();
+        if (isPresent(side))
+            lastPresentAt[side] = now;
     }
 };
+const median = (values) => {
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+};
+// Room temperature, 30-min median (winter heating cycles swing it ~1°F within the hour)
+const roomF = () => (roomSamples.length ? median(roomSamples.map(s => s.f)) : null);
+const settledEmpty = (side) => !isPresent(side) && Date.now() - lastPresentAt[side] >= EMPTY_AFTER_MS;
 // Current bed temperature for a side, or null when there is no fresh reading
 export const bedTemperatureF = (side) => {
     if (samples[side].length === 0) {
@@ -136,12 +170,9 @@ export const bedTemperatureF = (side) => {
             return null;
         }
     }
-    const sorted = samples[side].map(s => s.f).sort((a, b) => a - b);
-    if (sorted.length === 0)
+    if (samples[side].length === 0)
         return null;
-    const mid = Math.floor(sorted.length / 2);
-    const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-    return Math.round(median * 10) / 10;
+    return Math.round(median(samples[side].map(s => s.f)) * 10) / 10;
 };
 const readState = () => {
     try {
@@ -172,7 +203,18 @@ export const bedProportionalF = (side, setpointF) => {
         return 0;
     return Math.max(-MAX_PROPORTIONAL_F, Math.min(MAX_PROPORTIONAL_F, PROPORTIONAL_GAIN * (setpointF - bedF)));
 };
-const unclampedWaterF = (side, bed) => feedForwardF(bed.setpointF) + bed.offsetF + bedProportionalF(side, bed.setpointF);
+// Water that brings an empty bed to its setpoint, between the occupied-bed water and setpoint + 4°F
+export const emptyBedWaterF = (bed, room) => {
+    const occupiedF = feedForwardF(bed.setpointF) + bed.offsetF;
+    if (room === null)
+        return occupiedF;
+    const wantedF = (bed.setpointF - EMPTY_BED_INTERCEPT_F - EMPTY_BED_ROOM * room) / EMPTY_BED_WATER;
+    return Math.max(occupiedF, Math.min(bed.setpointF + EMPTY_MAX_ABOVE_SETPOINT_F, wantedF));
+};
+const unclampedWaterF = (side, bed) => (settledEmpty(side)
+    ? emptyBedWaterF(bed, roomF())
+    : feedForwardF(bed.setpointF) + bed.offsetF + bedProportionalF(side, bed.setpointF));
+export const bedIsSettledEmpty = settledEmpty;
 // A side's setpoint and offset. The first time (bed control just switched on) it is seeded from the
 // current bed temperature, with the offset that keeps the water where it is, so nothing moves.
 export const bedSide = (side) => {

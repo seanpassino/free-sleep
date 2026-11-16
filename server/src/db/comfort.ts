@@ -26,6 +26,16 @@ export type Comfort = {
     // Surface probe that is "the bed temperature": 'cen' (center/torso zone), 'avg'/'max'/'min', or 'body'
     // (the probes where capacitance finds the sleeper, center when the side is empty; bedControl.ts)
     probe: SurfaceProbe;
+    // Room compensation of bed setpoints (scheduled steps, power-on and 15-min re-checks): the same bed
+    // temperature feels colder in a colder room (chosen setpoints 2026-10-29 to 11-15: ~75 at a 71-72°F
+    // room, 82-84 at 64-66°F). Offset = gain x (baseRoomF - room), rounded, within [minOffsetF, maxOffsetF].
+    roomCompensation: {
+      enabled: boolean;
+      baseRoomF: number;
+      gain: number;
+      minOffsetF: number;
+      maxOffsetF: number;
+    };
   };
 };
 
@@ -40,6 +50,13 @@ const defaultData: Comfort = {
   surfaceControl: {
     enabled: false,
     probe: 'cen',
+    roomCompensation: {
+      enabled: false,
+      baseRoomF: 72,
+      gain: 0.6,
+      minOffsetF: -3,
+      maxOffsetF: 6,
+    },
   },
 };
 

@@ -5,9 +5,9 @@ import { updateDeviceStatus } from '../routes/deviceStatus/updateDeviceStatus.js
 import serverStatus from '../serverStatus.js';
 import settingsDB from '../db/settings.js';
 import logger from '../logger.js';
-import { getAmbientOffset, isWakeStep, logComfortEvent, recordAppliedOffset, surfaceControlEnabled } from './comfort.js';
+import { getAmbientOffset, isWakeStep, logComfortEvent, recordAppliedOffset, compensationEnabled } from './comfort.js';
 import { connectFranken } from '../8sleep/frankenServer.js';
-import { MAX_TARGET_F } from '../8sleep/temperatureLevels.js';
+import { MAX_TARGET_F, MIN_TARGET_F } from '../8sleep/temperatureLevels.js';
 // The side's current target, or null when it is off or the Pod can't be read
 const currentTargetF = async (side) => {
     try {
@@ -42,12 +42,11 @@ const scheduleAdjustment = (timeZone, side, day, time, temperature) => {
                 }
             }
             const wakeStep = await isWakeStep(temperature);
-            // Bed control holds the bed temperature itself, so skip the room offset.
-            const surfaceOn = await surfaceControlEnabled();
-            const { offsetF, roomF } = (wakeStep || surfaceOn) ? { offsetF: 0, roomF: null } : await getAmbientOffset();
-            let targetTemperatureF = Math.min(MAX_TARGET_F, temperature + offsetF);
+            const { offsetF, roomF } = wakeStep ? { offsetF: 0, roomF: null } : await getAmbientOffset();
+            let targetTemperatureF = Math.max(MIN_TARGET_F, Math.min(MAX_TARGET_F, temperature + offsetF));
             if (offsetF) {
-                logJob(`Room is ${roomF}°F, warming scheduled ${temperature}°F by ${offsetF}°F`, side, day, dayOfWeekIndex, time);
+                const verb = offsetF > 0 ? 'warming' : 'cooling';
+                logJob(`Room is ${roomF}°F, ${verb} scheduled ${temperature}°F by ${Math.abs(offsetF)}°F`, side, day, dayOfWeekIndex, time);
             }
             // A wake step only ever warms the bed. The room offset and re-checks can already have carried
             // the bed above it (2026-10-24: the 08:30 86°F step cooled the bed from 87°F).
@@ -61,7 +60,7 @@ const scheduleAdjustment = (timeZone, side, day, time, temperature) => {
                     targetTemperatureF,
                 }
             });
-            recordAppliedOffset(side, (wakeStep || surfaceOn) ? null : offsetF);
+            recordAppliedOffset(side, (wakeStep || !(await compensationEnabled())) ? null : offsetF);
             logComfortEvent('schedule', {
                 side, step: time, wakeStep, scheduledF: temperature, offsetF, currentF, appliedF: targetTemperatureF, roomF,
             });

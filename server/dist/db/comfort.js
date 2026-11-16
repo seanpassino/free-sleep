@@ -15,6 +15,13 @@ const defaultData = {
     surfaceControl: {
         enabled: false,
         probe: 'cen',
+        roomCompensation: {
+            enabled: false,
+            baseRoomF: 72,
+            gain: 0.6,
+            minOffsetF: -3,
+            maxOffsetF: 6,
+        },
     },
 };
 const file = new JSONFile(`${config.lowDbFolder}comfortDB.json`);
