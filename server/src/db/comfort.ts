@@ -36,6 +36,9 @@ export type Comfort = {
       minOffsetF: number;
       maxOffsetF: number;
     };
+    // Getting into a pre-warmed bed: time constant (min) over which the water eases from the empty-bed
+    // target to the occupied-bed one, and cooling by the loop fades in. 0 = switch at once.
+    entryHandoffMinutes: number;
   };
 };
 
@@ -57,6 +60,7 @@ const defaultData: Comfort = {
       minOffsetF: -3,
       maxOffsetF: 6,
     },
+    entryHandoffMinutes: 20,
   },
 };
 

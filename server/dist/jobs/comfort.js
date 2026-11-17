@@ -12,7 +12,7 @@ import { updateDeviceStatus } from '../routes/deviceStatus/updateDeviceStatus.js
 import logger from '../logger.js';
 import { fToLevel, levelToF, MAX_TARGET_F, MIN_TARGET_F } from '../8sleep/temperatureLevels.js';
 import { executeFunction } from '../8sleep/deviceApi.js';
-import { bedControlEnabled, bedIsSettledEmpty, bedProportionalF, bedSide, bedTemperatureF, bedWaterF, correctBed, noteWaterTarget, sampleSurface, waterTargetLevel, } from '../8sleep/bedControl.js';
+import { bedControlEnabled, bedHandoff, bedIsSettledEmpty, bedProportionalF, bedSide, bedTemperatureF, bedWaterF, correctBed, noteWaterTarget, sampleSurface, waterTargetLevel, } from '../8sleep/bedControl.js';
 import { isPresent } from '../routes/metrics/presence.js';
 import { recordBedTemperatures } from './bedHistory.js';
 export const COMFORT_LOG = '/persistent/free-sleep-data/comfort-log.jsonl';
@@ -210,9 +210,15 @@ const bedControlTick = async (sensors, status) => {
             const bed = bedSide(side);
             const pF = bed ? Math.round(bedProportionalF(side, bed.setpointF) * 100) / 100 : 0;
             const empty = bedIsSettledEmpty(side);
+            // While someone is getting into a pre-warmed bed: the water still added, and the share left
+            const handoff = bedHandoff(side);
             logger.info(`BedControl: ${side} bed ${bedF}°F, setpoint ${bed?.setpointF}°F -> water ${levelToF(level)}°F`
-                + ` (offset ${bed?.offsetF.toFixed(2)}, P ${pF > 0 ? '+' : ''}${pF.toFixed(2)}${empty ? ', empty bed' : ''})`);
-            logComfortEvent('bed_correct', { side, bedF, waterF, level, pF, setpointF: bed?.setpointF, offsetF: bed?.offsetF, empty });
+                + ` (offset ${bed?.offsetF.toFixed(2)}, P ${pF > 0 ? '+' : ''}${pF.toFixed(2)}${empty ? ', empty bed' : ''}`
+                + `${handoff ? `, getting in +${handoff.extraF.toFixed(1)}` : ''})`);
+            logComfortEvent('bed_correct', {
+                side, bedF, waterF, level, pF, setpointF: bed?.setpointF, offsetF: bed?.offsetF, empty,
+                ...(handoff ? { handoffF: handoff.extraF, handoffShare: handoff.share } : {}),
+            });
         }
     }
     catch (error) {

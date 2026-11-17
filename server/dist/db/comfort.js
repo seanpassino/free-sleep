@@ -22,6 +22,7 @@ const defaultData = {
             minOffsetF: -3,
             maxOffsetF: 6,
         },
+        entryHandoffMinutes: 20,
     },
 };
 const file = new JSONFile(`${config.lowDbFolder}comfortDB.json`);

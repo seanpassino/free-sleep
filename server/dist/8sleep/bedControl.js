@@ -3,7 +3,8 @@
 // The firmware only takes a water target, so this is a PI loop around it, recalculated every minute:
 // water target = feed-forward(setpoint) + offset (the integral term) + proportional term.
 // While the side is empty only the first two apply and the offset is left alone; once it has been empty
-// a while the water is aimed at the empty bed instead (emptyBedWaterF).
+// a while the water is aimed at the empty bed instead (emptyBedWaterF). Getting into that pre-warmed bed
+// eases the water from one to the other instead of jumping (Handoff).
 // State: /persistent/free-sleep-data/bed-state.json.
 import fs from 'fs';
 import comfortDB from '../db/comfort.js';
@@ -52,6 +53,18 @@ const EMPTY_MAX_ABOVE_SETPOINT_F = 4;
 // after a restart even with someone in bed
 const EMPTY_AFTER_MS = 10 * 60 * 1000;
 const ROOM_WINDOW_MS = 30 * 60 * 1000;
+// Getting in. The empty-bed water runs well above the occupied-bed water (83 against 76°F at setpoint 79
+// in a 66°F room), and for the first 10-15 min body heat lifts the probe 2-4°F whatever the water does
+// (fit of 7 entries, 10-30 to 11-15: body heat arrives with a 9 min time constant, the water's effect
+// with 16). Switching formulas at once, with the proportional term reading that rise as "too warm",
+// dropped the water 83 -> 72°F in ten minutes on 2026-11-16, felt as the bed turning cool on getting in.
+// So the difference fades out with this time constant, and cooling by the proportional term fades in as
+// it does. comfortDB `surfaceControl.entryHandoffMinutes`; 0 = switch at once, as before.
+const HANDOFF_DEFAULT_MINUTES = 20;
+// Over once this little of the difference is left (three time constants; ~0.4°F, one firmware level)
+const HANDOFF_END_SHARE = 0.05;
+// Getting in follows an empty-bed water target at most this old (the loop runs every minute)
+const EMPTY_WATER_FRESH_MS = 3 * 60 * 1000;
 // Probe 'body': the bed temperature is the probes weighted by where capacitance finds the sleeper.
 // Below this summed rise over the empty-bed baseline there's no reliable position (the stream's
 // CapPresence stays confirmed down to the same level), so the center probe is used.
@@ -68,6 +81,9 @@ const roomSamples = [];
 // stream reports
 const startedAt = Date.now();
 const lastPresentAt = { left: startedAt, right: startedAt };
+// The empty-bed water last aimed at, and the last measured water temperature
+const emptyWater = {};
+const measuredWater = {};
 // Last water target the firmware reported, per side (noted by loadDeviceStatus)
 const waterTarget = {};
 export const bedControlEnabled = () => comfortDB.data.surfaceControl?.enabled === true;
@@ -143,6 +159,10 @@ export const sampleSurface = (sensors) => {
     }
     if (typeof sensors?.roomF === 'number' && now / 1000 - sensors.ts < SURFACE_STALE_SECONDS)
         roomSamples.push({ at: now, f: sensors.roomF });
+    if (sensors?.waterF && now / 1000 - sensors.ts < SURFACE_STALE_SECONDS) {
+        measuredWater.left = { at: now, f: sensors.waterF.left };
+        measuredWater.right = { at: now, f: sensors.waterF.right };
+    }
     while (roomSamples.length && now - roomSamples[0].at > ROOM_WINDOW_MS)
         roomSamples.shift();
     for (const side of ['left', 'right']) {
@@ -211,13 +231,77 @@ export const emptyBedWaterF = (bed, room) => {
     const wantedF = (bed.setpointF - EMPTY_BED_INTERCEPT_F - EMPTY_BED_ROOM * room) / EMPTY_BED_WATER;
     return Math.max(occupiedF, Math.min(bed.setpointF + EMPTY_MAX_ABOVE_SETPOINT_F, wantedF));
 };
-const unclampedWaterF = (side, bed) => (settledEmpty(side)
-    ? emptyBedWaterF(bed, roomF())
-    : feedForwardF(bed.setpointF) + bed.offsetF + bedProportionalF(side, bed.setpointF));
+const handoffMinutes = () => {
+    const minutes = comfortDB.data.surfaceControl?.entryHandoffMinutes;
+    return typeof minutes === 'number' && minutes >= 0 ? minutes : HANDOFF_DEFAULT_MINUTES;
+};
+// Share of a handoff's extra water still applied (1 on getting in, fading to 0), or null when none is
+// running
+const handoffShare = (handoff) => {
+    const minutes = handoffMinutes();
+    if (!handoff || minutes === 0)
+        return null;
+    const ageMinutes = (Date.now() - handoff.at) / 60_000;
+    if (ageMinutes < 0)
+        return null;
+    const share = Math.exp(-ageMinutes / minutes);
+    return share >= HANDOFF_END_SHARE ? share : null;
+};
+// Someone got into a bed whose water was aimed at the empty bed: start the handoff from the water as it
+// is (the measured one when lower: the pre-warm may only just have started)
+const startHandoff = (side) => {
+    const empty = emptyWater[side];
+    if (!empty || !isPresent(side))
+        return;
+    delete emptyWater[side];
+    const now = Date.now();
+    if (now - empty.at > EMPTY_WATER_FRESH_MS || handoffMinutes() === 0)
+        return;
+    const state = readState();
+    const bed = state[side];
+    if (!bed)
+        return;
+    const measured = measuredWater[side];
+    const fromF = measured && now - measured.at <= EMPTY_WATER_FRESH_MS ? Math.min(empty.f, measured.f) : empty.f;
+    const occupiedF = feedForwardF(bed.setpointF) + bed.offsetF;
+    const extraF = Math.round(Math.max(0, fromF - occupiedF) * 100) / 100;
+    state[side] = { ...bed, handoff: { at: now, extraF } };
+    writeState(state);
+    logger.info(`BedControl: ${side} got in, easing the water from ${fromF.toFixed(1)}°F to the occupied-bed ${occupiedF.toFixed(1)}°F`
+        + ` (${handoffMinutes()} min time constant)`);
+};
+const unclampedWaterF = (side, bed) => {
+    if (settledEmpty(side)) {
+        const waterF = emptyBedWaterF(bed, roomF());
+        emptyWater[side] = { at: Date.now(), f: clampF(waterF) };
+        return waterF;
+    }
+    const occupiedF = feedForwardF(bed.setpointF) + bed.offsetF;
+    const proportionalF = bedProportionalF(side, bed.setpointF);
+    const share = handoffShare(bed.handoff);
+    if (share === null || !bed.handoff)
+        return occupiedF + proportionalF;
+    const extraF = bed.handoff.extraF * share;
+    // A bed still short of its setpoint gets whichever is more, not both; a bed above it (body heat, at
+    // first) is cooled only as far as the handoff has run
+    return proportionalF >= 0
+        ? occupiedF + Math.max(proportionalF, extraF)
+        : occupiedF + extraF + proportionalF * (1 - share);
+};
+// What a running handoff adds to the water now (°F), and how much of the proportional term's cooling is
+// applied; null when none is running
+export const bedHandoff = (side) => {
+    const bed = readState()[side];
+    const share = settledEmpty(side) ? null : handoffShare(bed?.handoff);
+    if (share === null || !bed?.handoff)
+        return null;
+    return { extraF: Math.round(bed.handoff.extraF * share * 100) / 100, share: Math.round(share * 100) / 100 };
+};
 export const bedIsSettledEmpty = settledEmpty;
 // A side's setpoint and offset. The first time (bed control just switched on) it is seeded from the
 // current bed temperature, with the offset that keeps the water where it is, so nothing moves.
 export const bedSide = (side) => {
+    startHandoff(side);
     const state = readState();
     const existing = state[side];
     if (existing)
@@ -241,7 +325,7 @@ export const bedWaterF = (side) => {
 // New bed setpoint from the app, HA, a button or a schedule. Returns the water target to send.
 export const setBedSetpoint = (side, setpointF) => {
     const current = bedSide(side);
-    const updated = { setpointF: clampF(setpointF), offsetF: current?.offsetF ?? 0 };
+    const updated = { ...current, setpointF: clampF(setpointF), offsetF: current?.offsetF ?? 0 };
     const state = readState();
     state[side] = updated;
     writeState(state);
@@ -268,6 +352,9 @@ export const correctBed = (side) => {
         return null;
     const rate = noteTrend(side, bedF);
     const errorF = current.setpointF - bedF;
+    // Not while getting in: the error then is body heat arriving, not a wrong offset
+    if (handoffShare(current.handoff) !== null)
+        return null;
     if (Math.abs(errorF) < INTEGRAL_DEADBAND_F || Math.abs(errorF) > INTEGRAL_MAX_ERROR_F)
         return null;
     if (errorF * rate > 0 && Math.abs(rate) >= INTEGRAL_APPROACH_RATE)
@@ -278,7 +365,7 @@ export const correctBed = (side) => {
         return null;
     const offsetF = Math.max(-MAX_OFFSET_F, Math.min(MAX_OFFSET_F, current.offsetF + INTEGRAL_GAIN_PER_MIN * errorF));
     const state = readState();
-    state[side] = { setpointF: current.setpointF, offsetF };
+    state[side] = { ...current, offsetF };
     writeState(state);
     return { setpointF: current.setpointF, bedF, offsetF };
 };
