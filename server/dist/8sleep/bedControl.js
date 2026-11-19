@@ -63,6 +63,12 @@ const ROOM_WINDOW_MS = 30 * 60 * 1000;
 const HANDOFF_DEFAULT_MINUTES = 20;
 // Over once this little of the difference is left (three time constants; ~0.4°F, one firmware level)
 const HANDOFF_END_SHARE = 0.05;
+// While it runs, this much bed above the setpoint is taken as body heat and doesn't cool the water. On
+// 2026-11-17 the probe rose +3.4°F in 10 min, the proportional term still cooled the water 83 -> 74 in
+// 27 min, and Sean felt it cool too fast and too far.
+const HANDOFF_BODY_HEAT_F = 3;
+// ... fading to nothing between this share and the end (at 30 min: from ~42 min to 90 min)
+const HANDOFF_ALLOWANCE_FADE_SHARE = 0.25;
 // Getting in follows an empty-bed water target at most this old (the loop runs every minute)
 const EMPTY_WATER_FRESH_MS = 3 * 60 * 1000;
 // Probe 'body': the bed temperature is the probes weighted by where capacitance finds the sleeper.
@@ -282,11 +288,13 @@ const unclampedWaterF = (side, bed) => {
     if (share === null || !bed.handoff)
         return occupiedF + proportionalF;
     const extraF = bed.handoff.extraF * share;
-    // A bed still short of its setpoint gets whichever is more, not both; a bed above it (body heat, at
-    // first) is cooled only as far as the handoff has run
-    return proportionalF >= 0
-        ? occupiedF + Math.max(proportionalF, extraF)
-        : occupiedF + extraF + proportionalF * (1 - share);
+    // A bed still short of its setpoint gets whichever is more, not both
+    if (proportionalF >= 0)
+        return occupiedF + Math.max(proportionalF, extraF);
+    // A bed above it is body heat at first: the first few °F above the setpoint cool nothing, fading out
+    // over the end of the handoff so the proportional term comes back without a step
+    const allowanceF = PROPORTIONAL_GAIN * HANDOFF_BODY_HEAT_F * Math.min(1, share / HANDOFF_ALLOWANCE_FADE_SHARE);
+    return occupiedF + extraF + Math.min(0, proportionalF + allowanceF);
 };
 // What a running handoff adds to the water now (°F), and how much of the proportional term's cooling is
 // applied; null when none is running
