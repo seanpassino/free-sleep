@@ -3,8 +3,9 @@
 // The firmware only takes a water target, so this is a PI loop around it, recalculated every minute:
 // water target = feed-forward(setpoint) + offset (the integral term) + proportional term.
 // While the side is empty only the first two apply and the offset is left alone; once it has been empty
-// a while the water is aimed at the empty bed instead (emptyBedWaterF). Getting into that pre-warmed bed
-// eases the water from one to the other instead of jumping (Handoff).
+// a while the empty bed gets a PI loop of its own (emptyBedWaterF, correctEmptyBed), with its own offset,
+// so it is held at the setpoint too. Getting into that warmed bed eases the water from one to the other
+// instead of jumping (Handoff).
 // State: /persistent/free-sleep-data/bed-state.json.
 import fs from 'fs';
 import comfortDB from '../db/comfort.js';
@@ -17,7 +18,8 @@ import { levelToF, MAX_TARGET_F, MIN_TARGET_F } from './temperatureLevels.js';
 type Side = 'left' | 'right';
 // Getting into a pre-warmed bed: when it started, and how far the water was above the occupied-bed water
 type Handoff = { at: number; extraF: number };
-type BedSide = { setpointF: number; offsetF: number; handoff?: Handoff };
+// emptyOffsetF: the empty bed's integral term, kept apart from offsetF, which is mostly body heat
+type BedSide = { setpointF: number; offsetF: number; emptyOffsetF?: number; handoff?: Handoff };
 type BedState = Partial<Record<Side, BedSide>>;
 
 const BED_STATE = '/persistent/free-sleep-data/bed-state.json';
@@ -54,9 +56,39 @@ const FEED_FORWARD_REFERENCE_F = 76;
 const EMPTY_BED_INTERCEPT_F = 0.11;
 const EMPTY_BED_WATER = 0.52;
 const EMPTY_BED_ROOM = 0.515;
-// Fully holding an empty bed in a cold room takes water far above the setpoint (80 at 66°F: ~88), which
-// would be too hot to get into once body heat adds its 2-4°F, so the pre-warm stops here
-const EMPTY_MAX_ABOVE_SETPOINT_F = 4;
+// That fit is only the feed-forward now. Until 2026-11-19 it was the whole empty-bed control (open loop,
+// capped at setpoint + 4): that night (room 69) it held the water at 82 for setpoint 78 and the empty bed
+// went on to 80, the untouched left side to 79. So the empty bed has its own PI loop around the fit.
+// Its integral term, water °F, starts here: what 11-19 needed (bed ~1.5°F over the fit at 0.52 bed per
+// water °F), and it's learned from then on, per side, in bed-state.json.
+const EMPTY_OFFSET_SEED_F = -2.5;
+const EMPTY_MAX_OFFSET_F = 8;
+// The empty mattress follows the water about 0.52°F per °F with a ~16 min time constant (fit, nights
+// 10-30 to 11-15). Proportional gain as for the occupied bed; the integral a little faster (time ~15 min),
+// since the empty bed moves only half as much per °F of water. Simulated on that model (LXC 102 ~/bed-review/empty-bed-loop/harness.mjs).
+const EMPTY_PROPORTIONAL_GAIN = 1.5;
+const EMPTY_INTEGRAL_GAIN_PER_MIN = 0.1;
+// Water no hotter than this above the setpoint, whatever the loop asks (a 64°F room at setpoint 82 wants
+// ~90). The entry handoff starts from it and eases down, so on a cold night more here means a bed at its
+// setpoint on getting in but warmer for the first half hour (simulated, 64°F room, setpoint 82: +8 gets
+// the empty bed to ~81.5 and peaks ~88.7 after getting in; the old +4 got 79.5 and 86.7). comfortDB
+// `surfaceControl.emptyMaxAboveSetpointF`.
+const EMPTY_MAX_ABOVE_SETPOINT_F = 8;
+// Something the presence sensor doesn't count may be on the bed (lying on top of the covers on 11-18 read
+// 90°F with presence never confirmed; a pet, a laptop). Then the loop holds still: no proportional term,
+// no learning, until it has been clear this long. Signs of it: the summed capacitance rise over the
+// empty-bed baseline at least EMPTY_LOAD_RISE (empty readings sit within ~200 of it; getting in ~3000),
+// the bed reading warmer than an empty bed can (warmer than the water heating it by this margin, once the
+// water has reached its target and is above the room), or the bed warming faster than the water warms it
+// (°F/min, 5 min average; warming up from cold reached ~0.18 on 11-19 and ~0.3 simulated at a 64°F room;
+// lying down ~1).
+const EMPTY_LOAD_RISE = 500;
+const EMPTY_LOAD_MARGIN_F = 1;
+const EMPTY_WATER_SETTLED_F = 1;
+const EMPTY_LOAD_RATE = 0.5;
+const EMPTY_LOAD_CLEAR_MS = 15 * 60 * 1000;
+// With no room reading, the feed-forward assumes this room
+const EMPTY_DEFAULT_ROOM_F = 68;
 // Only after the side has been empty this long: presence flickers, and reads empty for a few minutes
 // after a restart even with someone in bed
 const EMPTY_AFTER_MS = 10 * 60 * 1000;
@@ -103,6 +135,9 @@ const emptyWater: Partial<Record<Side, { at: number; f: number }>> = {};
 const measuredWater: Partial<Record<Side, { at: number; f: number }>> = {};
 // Last water target the firmware reported, per side (noted by loadDeviceStatus)
 const waterTarget: Partial<Record<Side, { level: number; f: number }>> = {};
+// Latest capacitance per side, and when the empty bed last looked like something was on it
+const latestCap: Partial<Record<Side, CapZones>> = {};
+const emptyLoadAt: Partial<Record<Side, number>> = {};
 
 export const bedControlEnabled = () => comfortDB.data.surfaceControl?.enabled === true;
 
@@ -182,6 +217,10 @@ export const sampleSurface = (sensors: SensorSnapshot | null) => {
     samples.right.push({ at: now, f: probeValue('right', sensors.surfaceF.right, sensors.capacitance?.right) });
   }
   if (typeof sensors?.roomF === 'number' && now / 1000 - sensors.ts < SURFACE_STALE_SECONDS) roomSamples.push({ at: now, f: sensors.roomF });
+  if (sensors?.capacitance && now / 1000 - sensors.ts < SURFACE_STALE_SECONDS) {
+    latestCap.left = sensors.capacitance.left ?? undefined;
+    latestCap.right = sensors.capacitance.right ?? undefined;
+  }
   if (sensors?.waterF && now / 1000 - sensors.ts < SURFACE_STALE_SECONDS) {
     measuredWater.left = { at: now, f: sensors.waterF.left };
     measuredWater.right = { at: now, f: sensors.waterF.right };
@@ -250,13 +289,81 @@ export const bedProportionalF = (side: Side, setpointF: number): number => {
   return Math.max(-MAX_PROPORTIONAL_F, Math.min(MAX_PROPORTIONAL_F, PROPORTIONAL_GAIN * (setpointF - bedF)));
 };
 
-// Water that brings an empty bed to its setpoint, between the occupied-bed water and setpoint + 4°F
-export const emptyBedWaterF = (bed: BedSide, room: number | null): number => {
-  const occupiedF = feedForwardF(bed.setpointF) + bed.offsetF;
-  if (room === null) return occupiedF;
-  const wantedF = (bed.setpointF - EMPTY_BED_INTERCEPT_F - EMPTY_BED_ROOM * room) / EMPTY_BED_WATER;
-  return Math.max(occupiedF, Math.min(bed.setpointF + EMPTY_MAX_ABOVE_SETPOINT_F, wantedF));
+// Empty bed: the fitted water for the setpoint in this room, plus the learned empty offset
+const emptyFeedForwardF = (bed: BedSide, room: number | null) => {
+  const roomF = room ?? EMPTY_DEFAULT_ROOM_F;
+  return (bed.setpointF - EMPTY_BED_INTERCEPT_F - EMPTY_BED_ROOM * roomF) / EMPTY_BED_WATER
+    + (bed.emptyOffsetF ?? EMPTY_OFFSET_SEED_F);
 };
+
+const emptyMaxF = (bed: BedSide) => {
+  const configured = comfortDB.data.surfaceControl?.emptyMaxAboveSetpointF;
+  return bed.setpointF + (typeof configured === 'number' && configured >= 0 ? configured : EMPTY_MAX_ABOVE_SETPOINT_F);
+};
+
+// How fast the bed is moving (°F per min, averaged), kept separately for the empty and occupied loops
+const trend: Partial<Record<Side, { bedF: number; at: number; rate: number }>> = {};
+const emptyTrend: typeof trend = {};
+
+const noteTrend = (trends: typeof trend, side: Side, bedF: number): number => {
+  const now = Date.now();
+  const last = trends[side];
+  // A gap means the loop wasn't running, so the old reading says nothing about the bed now
+  const rate = last && now - last.at <= 2 * 60 * 1000
+    ? last.rate + ((bedF - last.bedF) - last.rate) / TREND_SMOOTHING_MINUTES
+    : 0;
+  trends[side] = { bedF, at: now, rate };
+  return rate;
+};
+
+const capRise = (side: Side): number | null => {
+  const cap = latestCap[side];
+  const baseline = cap ? capBaseline(side) : null;
+  if (!cap || !baseline) return null;
+  return Math.max(cap.out - baseline.out, 0) + Math.max(cap.cen - baseline.cen, 0) + Math.max(cap.in - baseline.in, 0);
+};
+
+const emptyHeld = (side: Side) => {
+  const at = emptyLoadAt[side];
+  return at !== undefined && Date.now() - at < EMPTY_LOAD_CLEAR_MS;
+};
+
+// Whether something may be on the empty bed now (see EMPTY_LOAD_RISE); notes it and logs the changes
+const checkEmptyLoad = (side: Side, bedF: number, rate: number): boolean => {
+  const now = Date.now();
+  const rise = capRise(side);
+  const water = measuredWater[side];
+  const room = roomF();
+  const target = waterTarget[side];
+  const waterSettled = water && now - water.at <= EMPTY_WATER_FRESH_MS && target && Math.abs(water.f - target.f) <= EMPTY_WATER_SETTLED_F
+    && (room === null || water.f > room);
+  const reasons = [
+    rise !== null && rise >= EMPTY_LOAD_RISE ? `capacitance +${Math.round(rise)}` : null,
+    waterSettled && bedF >= water.f + EMPTY_LOAD_MARGIN_F ? `bed ${bedF}°F, water ${water.f.toFixed(1)}°F` : null,
+    rate >= EMPTY_LOAD_RATE ? `bed warming ${rate.toFixed(2)}°F/min` : null,
+  ].filter(Boolean);
+  const wasLoaded = emptyHeld(side);
+  if (reasons.length) {
+    emptyLoadAt[side] = now;
+    if (!wasLoaded) logger.info(`BedControl: ${side} empty bed may have something on it (${reasons.join(', ')}), holding the water`);
+    return true;
+  }
+  if (wasLoaded === false) return false;
+  const loaded = emptyHeld(side);
+  if (!loaded) logger.info(`BedControl: ${side} empty bed clear again, controlling it`);
+  return loaded;
+};
+
+// Proportional term for the empty bed: none while something may be on it
+const emptyProportionalF = (side: Side, bed: BedSide): number => {
+  const bedF = bedTemperatureF(side);
+  if (bedF === null || emptyHeld(side)) return 0;
+  return Math.max(-MAX_PROPORTIONAL_F, Math.min(MAX_PROPORTIONAL_F, EMPTY_PROPORTIONAL_GAIN * (bed.setpointF - bedF)));
+};
+
+// Water that holds an empty bed at its setpoint
+export const emptyBedWaterF = (side: Side, bed: BedSide): number =>
+  Math.min(emptyMaxF(bed), emptyFeedForwardF(bed, roomF()) + emptyProportionalF(side, bed));
 
 const handoffMinutes = () => {
   const minutes = comfortDB.data.surfaceControl?.entryHandoffMinutes;
@@ -299,7 +406,7 @@ const startHandoff = (side: Side) => {
 
 const unclampedWaterF = (side: Side, bed: BedSide) => {
   if (settledEmpty(side)) {
-    const waterF = emptyBedWaterF(bed, roomF());
+    const waterF = emptyBedWaterF(side, bed);
     emptyWater[side] = { at: Date.now(), f: clampF(waterF) };
     return waterF;
   }
@@ -361,27 +468,13 @@ export const setBedSetpoint = (side: Side, setpointF: number): number => {
   return clampF(unclampedWaterF(side, updated));
 };
 
-// How fast the bed is moving, for a side the loop is correcting (°F per min, averaged)
-const trend: Partial<Record<Side, { bedF: number; at: number; rate: number }>> = {};
-
-const noteTrend = (side: Side, bedF: number): number => {
-  const now = Date.now();
-  const last = trend[side];
-  // A gap means the side was empty or off, so the old reading says nothing about the bed now
-  const rate = last && now - last.at <= 2 * 60 * 1000
-    ? last.rate + ((bedF - last.bedF) - last.rate) / TREND_SMOOTHING_MINUTES
-    : 0;
-  trend[side] = { bedF, at: now, rate };
-  return rate;
-};
-
 // One minute of the integral term for a side that is on and occupied. Returns what it did, or null
 // when it left the offset alone.
 export const correctBed = (side: Side): { setpointF: number; bedF: number; offsetF: number } | null => {
   const current = bedSide(side);
   const bedF = bedTemperatureF(side);
   if (!current || bedF === null) return null;
-  const rate = noteTrend(side, bedF);
+  const rate = noteTrend(trend, side, bedF);
   const errorF = current.setpointF - bedF;
   // Not while getting in: the error then is body heat arriving, not a wrong offset
   if (handoffShare(current.handoff) !== null) return null;
@@ -395,4 +488,40 @@ export const correctBed = (side: Side): { setpointF: number; bedF: number; offse
   state[side] = { ...current, offsetF };
   writeState(state);
   return { setpointF: current.setpointF, bedF, offsetF };
+};
+
+// One minute of the empty bed's integral term, for a side that is on and settled empty. Returns what it
+// did, or null when it left the offset alone.
+export const correctEmptyBed = (side: Side): { setpointF: number; bedF: number; emptyOffsetF: number } | null => {
+  if (!settledEmpty(side)) {
+    delete emptyTrend[side];
+    return null;
+  }
+  const current = bedSide(side);
+  const bedF = bedTemperatureF(side);
+  if (!current || bedF === null) return null;
+  const rate = noteTrend(emptyTrend, side, bedF);
+  if (checkEmptyLoad(side, bedF, rate)) return null;
+  const errorF = current.setpointF - bedF;
+  if (Math.abs(errorF) < INTEGRAL_DEADBAND_F || Math.abs(errorF) > INTEGRAL_MAX_ERROR_F) return null;
+  if (errorF * rate > 0 && Math.abs(rate) >= INTEGRAL_APPROACH_RATE) return null;
+  // At a limit more offset does nothing, so don't let it pile up
+  const waterF = emptyFeedForwardF(current, roomF()) + emptyProportionalF(side, current);
+  if (errorF > 0 && (waterF >= emptyMaxF(current) || waterF >= MAX_TARGET_F)) return null;
+  if (errorF < 0 && waterF <= MIN_TARGET_F) return null;
+  const before = current.emptyOffsetF ?? EMPTY_OFFSET_SEED_F;
+  const emptyOffsetF = Math.max(-EMPTY_MAX_OFFSET_F, Math.min(EMPTY_MAX_OFFSET_F, before + EMPTY_INTEGRAL_GAIN_PER_MIN * errorF));
+  const state = readState();
+  state[side] = { ...current, emptyOffsetF };
+  writeState(state);
+  return { setpointF: current.setpointF, bedF, emptyOffsetF };
+};
+
+// The empty bed's offset, and whether its loop is holding because something may be on the bed
+// (and its proportional term), or null when the side isn't settled empty
+export const bedEmptyControl = (side: Side): { emptyOffsetF: number; held: boolean; pF: number } | null => {
+  if (!settledEmpty(side)) return null;
+  const bed = readState()[side];
+  if (!bed) return null;
+  return { emptyOffsetF: bed.emptyOffsetF ?? EMPTY_OFFSET_SEED_F, held: emptyHeld(side), pF: emptyProportionalF(side, bed) };
 };

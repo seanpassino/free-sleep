@@ -39,6 +39,8 @@ export type Comfort = {
     // Getting into a pre-warmed bed: time constant (min) over which the water eases from the empty-bed
     // target to the occupied-bed one, and cooling by the loop fades in. 0 = switch at once.
     entryHandoffMinutes: number;
+    // Empty bed: the water may run at most this far above the setpoint while warming it (default 8)
+    emptyMaxAboveSetpointF?: number;
   };
 };
 

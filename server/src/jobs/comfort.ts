@@ -14,7 +14,8 @@ import logger from '../logger.js';
 import { fToLevel, levelToF, MAX_TARGET_F, MIN_TARGET_F } from '../8sleep/temperatureLevels.js';
 import { executeFunction } from '../8sleep/deviceApi.js';
 import {
-  bedControlEnabled, bedHandoff, bedIsSettledEmpty, bedProportionalF, bedSide, bedTemperatureF, bedWaterF, correctBed, noteWaterTarget,
+  bedControlEnabled, bedEmptyControl, bedHandoff, bedIsSettledEmpty, bedProportionalF, bedSide, bedTemperatureF, bedWaterF, correctBed,
+  correctEmptyBed, noteWaterTarget,
   sampleSurface, waterTargetLevel,
 } from '../8sleep/bedControl.js';
 import { DeviceStatus } from '../routes/deviceStatus/deviceStatusSchema.js';
@@ -197,8 +198,8 @@ const recheck = async () => {
 // Bed control: each minute, for each side that is on (and not in away mode), run the bed temperature
 // loop (8sleep/bedControl.ts) and send the water target when its firmware level changes. A side whose
 // partner is in away mode drives both sides' water, as updateDeviceStatus does.
-// The loop's corrections need someone in bed: an empty bed runs ~3°F cooler than an occupied one at the
-// same water, so correcting it would undo the offset just before bedtime.
+// An empty bed runs ~3°F cooler than an occupied one at the same water, so each has its own correction:
+// correctBed while someone is in bed, correctEmptyBed once the side has been empty a while.
 const bedControlTick = async (sensors: SensorSnapshot | null, status: DeviceStatus | null) => {
   try {
     if (!bedControlEnabled() || !status) return;
@@ -207,6 +208,7 @@ const bedControlTick = async (sensors: SensorSnapshot | null, status: DeviceStat
     for (const side of ['left', 'right'] as const) {
       if (settingsDB.data[side].awayMode || !status[side].isOn) continue;
       if (isPresent(side)) correctBed(side);
+      else correctEmptyBed(side);
       const waterF = bedWaterF(side);
       if (waterF === null) continue;
       const level = fToLevel(waterF);
@@ -217,17 +219,24 @@ const bedControlTick = async (sensors: SensorSnapshot | null, status: DeviceStat
       }
       const bedF = bedTemperatureF(side);
       const bed = bedSide(side);
-      const pF = bed ? Math.round(bedProportionalF(side, bed.setpointF) * 100) / 100 : 0;
       const empty = bedIsSettledEmpty(side);
       // While someone is getting into a pre-warmed bed: the water still added, and the share left
       const handoff = bedHandoff(side);
+      // The empty bed's own offset and P, and whether its loop is holding for something on the bed
+      const emptyControl = bedEmptyControl(side);
+      const rawP = emptyControl ? emptyControl.pF : bed ? bedProportionalF(side, bed.setpointF) : 0;
+      const pF = Math.round(rawP * 100) / 100;
+      const emptyNote = emptyControl
+        ? `, empty bed, empty offset ${emptyControl.emptyOffsetF.toFixed(2)}${emptyControl.held ? ', holding' : ''}`
+        : '';
       logger.info(
         `BedControl: ${side} bed ${bedF}°F, setpoint ${bed?.setpointF}°F -> water ${levelToF(level)}°F`
-        + ` (offset ${bed?.offsetF.toFixed(2)}, P ${pF > 0 ? '+' : ''}${pF.toFixed(2)}${empty ? ', empty bed' : ''}`
+        + ` (offset ${bed?.offsetF.toFixed(2)}, P ${pF > 0 ? '+' : ''}${pF.toFixed(2)}${emptyNote}`
         + `${handoff ? `, getting in +${handoff.extraF.toFixed(1)}` : ''})`,
       );
       logComfortEvent('bed_correct', {
         side, bedF, waterF, level, pF, setpointF: bed?.setpointF, offsetF: bed?.offsetF, empty,
+        ...(emptyControl ? { emptyOffsetF: emptyControl.emptyOffsetF, emptyHeld: emptyControl.held } : {}),
         ...(handoff ? { handoffF: handoff.extraF, handoffShare: handoff.share } : {}),
       });
     }
